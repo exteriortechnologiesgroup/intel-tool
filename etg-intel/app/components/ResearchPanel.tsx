@@ -1,7 +1,7 @@
 'use client'
 
 import { useState } from 'react'
-import { RESEARCH_QUERIES } from '@/lib/types'
+import { RESEARCH_QUERIES, ETG_KEYWORDS, EXTRACTION_SYSTEM_PROMPT } from '@/lib/types'
 
 interface Props {
   onComplete: () => void
@@ -15,58 +15,127 @@ interface SourceResult {
   error?: string
 }
 
-interface Source {
-  id: string
-  label: string
-  desc: string
-  available: boolean
-  count?: number // number of sub-calls (web search only)
-}
-
-const ALL_SOURCES: Source[] = [
-  { id: 'dcn',          label: 'Daily Commercial News',   desc: 'RSS feed — tender notices',           available: true },
-  { id: 'onsite',       label: 'On-Site Magazine',         desc: 'RSS feed — project news',             available: true },
-  { id: 'canarchitect', label: 'Canadian Architect',       desc: 'Projects page — direct fetch',        available: true },
-  { id: 'websearch',    label: 'Web Search',               desc: `${RESEARCH_QUERIES.length} targeted queries`, available: true, count: RESEARCH_QUERIES.length },
+const SERVER_SOURCES = [
+  { id: 'dcn',          label: 'Daily Commercial News',  desc: 'RSS feed — tender notices' },
+  { id: 'onsite',       label: 'On-Site Magazine',        desc: 'RSS feed — project news' },
+  { id: 'canarchitect', label: 'Canadian Architect',      desc: 'Projects page — direct fetch' },
 ]
 
 export default function ResearchPanel({ onComplete }: Props) {
   const [selected, setSelected] = useState<Set<string>>(
-    new Set(ALL_SOURCES.filter(s => s.available).map(s => s.id))
+    new Set([...SERVER_SOURCES.map(s => s.id), 'websearch'])
   )
-  const [running, setRunning]   = useState(false)
-  const [results, setResults]   = useState<Record<string, SourceResult[]>>({})
-  const [done, setDone]         = useState(false)
+  const [running, setRunning]       = useState(false)
+  const [serverRows, setServerRows] = useState<SourceResult[]>([])
+  const [searchRows, setSearchRows] = useState<SourceResult[]>([])
+  const [done, setDone]             = useState(false)
   const [totalAdded, setTotalAdded] = useState(0)
 
-  const toggleSource = (id: string) => {
-    setSelected(prev => {
-      const next = new Set(prev)
-      next.has(id) ? next.delete(id) : next.add(id)
-      return next
-    })
-  }
+  const toggleSource = (id: string) =>
+    setSelected(prev => { const n = new Set(prev); n.has(id) ? n.delete(id) : n.add(id); return n })
 
-  const selectAll  = () => setSelected(new Set(ALL_SOURCES.filter(s => s.available).map(s => s.id)))
-  const selectNone = () => setSelected(new Set())
+  const patchServer = (i: number, patch: Partial<SourceResult>) =>
+    setServerRows(prev => prev.map((r, idx) => idx === i ? { ...r, ...patch } : r))
 
-  const setRow = (sourceId: string, idx: number, patch: Partial<SourceResult>) => {
-    setResults(prev => {
-      const rows = [...(prev[sourceId] ?? [])]
-      rows[idx] = { ...rows[idx], ...patch }
-      return { ...prev, [sourceId]: rows }
-    })
-  }
+  const patchSearch = (i: number, patch: Partial<SourceResult>) =>
+    setSearchRows(prev => prev.map((r, idx) => idx === i ? { ...r, ...patch } : r))
 
-  const callSource = async (sourceId: string, batchIndex?: number) => {
-    const res = await fetch('/api/research-source', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ source: sourceId, batchIndex }),
-    })
-    const data = await res.json()
-    if (!res.ok) throw new Error(data.error ?? 'Unknown error')
-    return data as { added: number; found: number }
+  // ── Client-side web search via Anthropic API directly ────────────────────
+  const runWebSearch = async (query: string, idx: number): Promise<number> => {
+    patchSearch(idx, { status: 'running' })
+    try {
+      const res = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'anthropic-dangerous-direct-browser-access': 'true',
+        },
+        body: JSON.stringify({
+          model: 'claude-sonnet-4-20250514',
+          max_tokens: 2048,
+          tools: [{ type: 'web_search_20250305', name: 'web_search' }],
+          messages: [{
+            role: 'user',
+            content: `Search for construction projects matching this query and return ALL project details: names, values, locations, architects, contractors, bid deadlines, material specs. Query: ${query}`,
+          }],
+        }),
+      })
+
+      if (!res.ok) {
+        const err = await res.json()
+        throw new Error(err.error?.message ?? `HTTP ${res.status}`)
+      }
+
+      const data = await res.json()
+      const text = (data.content ?? [])
+        .filter((b: { type: string }) => b.type === 'text')
+        .map((b: { text: string }) => b.text)
+        .join('\n')
+
+      if (!text.trim()) {
+        patchSearch(idx, { status: 'done', found: 0, added: 0 })
+        return 0
+      }
+
+      // Extract projects from search result text
+      const extractRes = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'anthropic-dangerous-direct-browser-access': 'true',
+        },
+        body: JSON.stringify({
+          model: 'claude-sonnet-4-20250514',
+          max_tokens: 4096,
+          system: EXTRACTION_SYSTEM_PROMPT,
+          messages: [{ role: 'user', content: `Source: websearch\n\n${text}` }],
+        }),
+      })
+
+      const extractData = await extractRes.json()
+      const rawText = (extractData.content ?? [])
+        .filter((b: { type: string }) => b.type === 'text')
+        .map((b: { text: string }) => b.text)
+        .join('')
+
+      let extracted: ReturnType<typeof JSON.parse>[] = []
+      try {
+        const clean = rawText.replace(/```json|```/g, '').trim()
+        extracted = JSON.parse(clean)
+      } catch {
+        const m = rawText.match(/\[[\s\S]*\]/)
+        if (m) extracted = JSON.parse(m[0])
+      }
+
+      if (!Array.isArray(extracted) || !extracted.length) {
+        patchSearch(idx, { status: 'done', found: 0, added: 0 })
+        return 0
+      }
+
+      // Normalise keywords
+      const normalised = extracted.map((p: Record<string, unknown>) => ({
+        ...p,
+        source: 'websearch',
+        keywords: ((p.keywords ?? []) as string[]).filter(k =>
+          ETG_KEYWORDS.some(ek => ek.toLowerCase() === k.toLowerCase())
+        ),
+      }))
+
+      // Save to Supabase via server route
+      const saveRes = await fetch('/api/ingest-projects', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ projects: normalised }),
+      })
+      const saveData = await saveRes.json()
+      const added = saveData.added ?? 0
+
+      patchSearch(idx, { status: 'done', found: extracted.length, added })
+      return added
+    } catch (e) {
+      patchSearch(idx, { status: 'error', error: e instanceof Error ? e.message : String(e) })
+      return 0
+    }
   }
 
   const runResearch = async () => {
@@ -75,46 +144,42 @@ export default function ResearchPanel({ onComplete }: Props) {
     setDone(false)
     setTotalAdded(0)
 
-    // Initialise result rows for each selected source
-    const init: Record<string, SourceResult[]> = {}
-    for (const src of ALL_SOURCES.filter(s => selected.has(s.id))) {
-      if (src.id === 'websearch') {
-        init.websearch = RESEARCH_QUERIES.map((q, i) => ({
-          label: `Query ${i + 1}: ${q.slice(0, 55)}${q.length > 55 ? '...' : ''}`,
-          status: 'pending', added: 0, found: 0,
-        }))
-      } else {
-        init[src.id] = [{ label: src.label, status: 'pending', added: 0, found: 0 }]
-      }
-    }
-    setResults(init)
+    const activeSrv = SERVER_SOURCES.filter(s => selected.has(s.id))
+    setServerRows(activeSrv.map(s => ({ label: s.label, status: 'pending', added: 0, found: 0 })))
+    setSearchRows(
+      selected.has('websearch')
+        ? RESEARCH_QUERIES.map((q, i) => ({
+            label: `Query ${i + 1}: ${q.slice(0, 58)}${q.length > 58 ? '...' : ''}`,
+            status: 'pending', added: 0, found: 0,
+          }))
+        : []
+    )
 
     let grand = 0
 
-    // ── Non-search sources first (fast) ────────────────────────────────────
-    for (const srcId of ['dcn', 'onsite', 'canarchitect']) {
-      if (!selected.has(srcId)) continue
-      setRow(srcId, 0, { status: 'running' })
+    // ── Server-side RSS + page fetches ──────────────────────────────────────
+    for (let i = 0; i < activeSrv.length; i++) {
+      patchServer(i, { status: 'running' })
       try {
-        const r = await callSource(srcId)
-        grand += r.added
-        setRow(srcId, 0, { status: 'done', added: r.added, found: r.found })
+        const res = await fetch('/api/research-source', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ source: activeSrv[i].id }),
+        })
+        const d = await res.json()
+        if (!res.ok) throw new Error(d.error ?? 'Failed')
+        grand += d.added ?? 0
+        patchServer(i, { status: 'done', added: d.added ?? 0, found: d.found ?? 0 })
       } catch (e) {
-        setRow(srcId, 0, { status: 'error', error: e instanceof Error ? e.message : String(e) })
+        patchServer(i, { status: 'error', error: e instanceof Error ? e.message : String(e) })
       }
     }
 
-    // ── Web searches one at a time ──────────────────────────────────────────
+    // ── Client-side web searches ────────────────────────────────────────────
     if (selected.has('websearch')) {
       for (let i = 0; i < RESEARCH_QUERIES.length; i++) {
-        setRow('websearch', i, { status: 'running' })
-        try {
-          const r = await callSource('websearch', i)
-          grand += r.added
-          setRow('websearch', i, { status: 'done', added: r.added, found: r.found })
-        } catch (e) {
-          setRow('websearch', i, { status: 'error', error: e instanceof Error ? e.message : String(e) })
-        }
+        const added = await runWebSearch(RESEARCH_QUERIES[i], i)
+        grand += added
       }
     }
 
@@ -124,14 +189,10 @@ export default function ResearchPanel({ onComplete }: Props) {
     onComplete()
   }
 
-  const reset = () => {
-    setResults({})
-    setDone(false)
-    setTotalAdded(0)
-  }
+  const reset = () => { setServerRows([]); setSearchRows([]); setDone(false); setTotalAdded(0) }
 
-  const totalRows = Object.values(results).flat()
-  const doneRows  = totalRows.filter(r => r.status === 'done' || r.status === 'error')
+  const allRows = [...serverRows, ...searchRows]
+  const doneCount = allRows.filter(r => r.status === 'done' || r.status === 'error').length
 
   return (
     <div style={{ flex: 1, overflowY: 'auto', padding: 24, display: 'flex', flexDirection: 'column', gap: 20 }}>
@@ -139,47 +200,43 @@ export default function ResearchPanel({ onComplete }: Props) {
       <div>
         <div style={{ fontSize: 15, fontWeight: 600, color: 'var(--text)', marginBottom: 4 }}>Research sources</div>
         <div style={{ fontSize: 13, color: 'var(--muted)', lineHeight: 1.6 }}>
-          Select which sources to scan. Each runs as a separate call to stay within server time limits.
+          Select which sources to scan. RSS fetches run server-side. Web searches run directly from your browser to avoid server timeouts.
         </div>
       </div>
 
-      {/* Source selector */}
+      {/* Source toggles */}
       {!running && (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 2 }}>
-            <div style={{ fontSize: 10, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: 'var(--muted)' }}>
-              Sources
-            </div>
-            <button onClick={selectAll} style={{ fontSize: 11, color: 'var(--accent)', background: 'none', border: 'none', padding: 0, cursor: 'pointer' }}>
+            <div style={{ fontSize: 10, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: 'var(--muted)' }}>Sources</div>
+            <button onClick={() => setSelected(new Set([...SERVER_SOURCES.map(s => s.id), 'websearch']))}
+              style={{ fontSize: 11, color: 'var(--accent)', background: 'none', border: 'none', padding: 0, cursor: 'pointer' }}>
               Select all
             </button>
-            <span style={{ fontSize: 11, color: 'var(--border2)' }}>·</span>
-            <button onClick={selectNone} style={{ fontSize: 11, color: 'var(--muted)', background: 'none', border: 'none', padding: 0, cursor: 'pointer' }}>
+            <span style={{ fontSize: 11, color: 'var(--muted)' }}>·</span>
+            <button onClick={() => setSelected(new Set())}
+              style={{ fontSize: 11, color: 'var(--muted)', background: 'none', border: 'none', padding: 0, cursor: 'pointer' }}>
               None
             </button>
           </div>
 
-          {ALL_SOURCES.map(src => (
-            <div
-              key={src.id}
-              onClick={() => src.available && toggleSource(src.id)}
-              style={{
-                display: 'flex', alignItems: 'center', gap: 12,
-                padding: '11px 14px', borderRadius: 8,
-                border: `1px solid ${selected.has(src.id) ? 'rgba(59,130,246,0.35)' : 'var(--border)'}`,
-                background: selected.has(src.id) ? 'var(--accent-dim)' : 'var(--surface2)',
-                cursor: src.available ? 'pointer' : 'default',
-                opacity: src.available ? 1 : 0.4,
-                transition: 'all 0.15s',
-              }}
-            >
-              {/* Checkbox */}
+          {[
+            ...SERVER_SOURCES.map(s => ({ ...s, available: true })),
+            { id: 'websearch', label: 'Web Search', desc: `${RESEARCH_QUERIES.length} targeted queries — runs in browser`, available: true },
+            { id: 'constructconnect', label: 'ConstructConnect Insight', desc: 'Login-gated — use Add Data tab instead', available: false },
+          ].map(src => (
+            <div key={src.id} onClick={() => src.available && toggleSource(src.id)} style={{
+              display: 'flex', alignItems: 'center', gap: 12,
+              padding: '11px 14px', borderRadius: 8, cursor: src.available ? 'pointer' : 'default',
+              border: `1px solid ${selected.has(src.id) ? 'rgba(59,130,246,0.35)' : 'var(--border)'}`,
+              background: selected.has(src.id) ? 'var(--accent-dim)' : 'var(--surface2)',
+              opacity: src.available ? 1 : 0.4, transition: 'all 0.15s',
+            }}>
               <div style={{
-                width: 16, height: 16, borderRadius: 4, flexShrink: 0,
+                width: 16, height: 16, borderRadius: 4, flexShrink: 0, transition: 'all 0.15s',
                 border: `1.5px solid ${selected.has(src.id) ? 'var(--accent)' : 'var(--border2)'}`,
                 background: selected.has(src.id) ? 'var(--accent)' : 'transparent',
                 display: 'flex', alignItems: 'center', justifyContent: 'center',
-                transition: 'all 0.15s',
               }}>
                 {selected.has(src.id) && (
                   <svg width="9" height="9" fill="none" stroke="white" strokeWidth="2.5" viewBox="0 0 24 24">
@@ -187,98 +244,62 @@ export default function ResearchPanel({ onComplete }: Props) {
                   </svg>
                 )}
               </div>
-
               <div style={{ flex: 1 }}>
                 <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text)' }}>{src.label}</div>
                 <div style={{ fontSize: 11, color: 'var(--muted)', marginTop: 1 }}>{src.desc}</div>
               </div>
-
-              {/* Available dot */}
-              <span style={{ width: 7, height: 7, borderRadius: '50%', background: src.available ? 'var(--green)' : 'var(--muted)', flexShrink: 0 }} />
+              <span style={{ width: 7, height: 7, borderRadius: '50%', flexShrink: 0, background: src.available ? 'var(--green)' : 'var(--muted)' }} />
             </div>
           ))}
-
-          {/* Unavailable note */}
-          <div style={{
-            display: 'flex', alignItems: 'flex-start', gap: 10,
-            padding: '10px 14px', borderRadius: 8,
-            border: '1px solid var(--border)', background: 'var(--surface2)', opacity: 0.45,
-          }}>
-            <div style={{ width: 16, height: 16, borderRadius: 4, border: '1.5px solid var(--border2)', flexShrink: 0 }} />
-            <div style={{ flex: 1 }}>
-              <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text)' }}>ConstructConnect Insight</div>
-              <div style={{ fontSize: 11, color: 'var(--muted)', marginTop: 1 }}>Login-gated — use the Add Data tab to paste content manually</div>
-            </div>
-            <span style={{ width: 7, height: 7, borderRadius: '50%', background: 'var(--muted)', flexShrink: 0, marginTop: 3 }} />
-          </div>
         </div>
       )}
 
       {/* Run button */}
       {!running && !done && (
-        <div>
-          <button
-            onClick={runResearch}
-            disabled={!selected.size}
-            style={{
-              display: 'flex', alignItems: 'center', gap: 8,
-              padding: '10px 22px', borderRadius: 8, border: 'none',
-              background: selected.size ? 'var(--accent)' : 'var(--surface3)',
-              color: selected.size ? 'white' : 'var(--muted)',
-              fontSize: 14, fontWeight: 600, transition: 'all 0.15s',
-            }}
-          >
-            <svg width="15" height="15" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
-              <circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/>
-            </svg>
-            Run research
-            {selected.size > 0 && (
-              <span style={{ fontSize: 12, opacity: 0.8 }}>
-                ({selected.size} source{selected.size !== 1 ? 's' : ''})
-              </span>
-            )}
-          </button>
-        </div>
+        <button onClick={runResearch} disabled={!selected.size} style={{
+          display: 'inline-flex', alignItems: 'center', gap: 8, width: 'fit-content',
+          padding: '10px 22px', borderRadius: 8, border: 'none',
+          background: selected.size ? 'var(--accent)' : 'var(--surface3)',
+          color: selected.size ? 'white' : 'var(--muted)',
+          fontSize: 14, fontWeight: 600, transition: 'all 0.15s',
+        }}>
+          <svg width="15" height="15" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+            <circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/>
+          </svg>
+          Run research
+          {selected.size > 0 && <span style={{ fontSize: 12, opacity: 0.8 }}>({selected.size} source{selected.size !== 1 ? 's' : ''})</span>}
+        </button>
       )}
 
       {/* Live progress */}
-      {(running || done) && Object.keys(results).length > 0 && (
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
-
-          {/* Overall progress bar */}
-          {running && totalRows.length > 0 && (
+      {(running || done) && (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+          {running && allRows.length > 0 && (
             <div>
               <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12, color: 'var(--muted)', marginBottom: 6 }}>
-                <span>Progress</span>
-                <span>{doneRows.length} / {totalRows.length}</span>
+                <span>Progress</span><span>{doneCount} / {allRows.length}</span>
               </div>
               <div style={{ height: 4, background: 'var(--surface3)', borderRadius: 2, overflow: 'hidden' }}>
-                <div style={{
-                  height: '100%', borderRadius: 2, background: 'var(--accent)',
-                  width: `${totalRows.length ? (doneRows.length / totalRows.length) * 100 : 0}%`,
-                  transition: 'width 0.4s ease',
-                }} />
+                <div style={{ height: '100%', borderRadius: 2, background: 'var(--accent)', transition: 'width 0.4s', width: `${allRows.length ? (doneCount / allRows.length) * 100 : 0}%` }} />
               </div>
             </div>
           )}
 
-          {/* Per-source rows */}
-          {ALL_SOURCES.filter(s => results[s.id]).map(src => (
-            <div key={src.id}>
-              {src.id !== 'websearch' ? (
-                results[src.id]?.map((row, i) => <ProgressRow key={i} item={row} />)
-              ) : (
-                <div>
-                  <div style={{ fontSize: 10, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: 'var(--muted)', marginBottom: 6 }}>
-                    Web searches ({results.websearch?.filter(r => r.status === 'done').length ?? 0} / {RESEARCH_QUERIES.length})
-                  </div>
-                  <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-                    {results.websearch?.map((row, i) => <ProgressRow key={i} item={row} compact />)}
-                  </div>
-                </div>
-              )}
+          {serverRows.length > 0 && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
+              <div style={{ fontSize: 10, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: 'var(--muted)', marginBottom: 2 }}>Sources</div>
+              {serverRows.map((r, i) => <ProgressRow key={i} item={r} />)}
             </div>
-          ))}
+          )}
+
+          {searchRows.length > 0 && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+              <div style={{ fontSize: 10, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: 'var(--muted)', marginBottom: 2 }}>
+                Web searches ({searchRows.filter(r => r.status === 'done').length} / {searchRows.length})
+              </div>
+              {searchRows.map((r, i) => <ProgressRow key={i} item={r} compact />)}
+            </div>
+          )}
         </div>
       )}
 
@@ -286,28 +307,19 @@ export default function ResearchPanel({ onComplete }: Props) {
       {done && (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
           <div style={{
-            background: 'var(--surface)', border: '1px solid var(--border)',
-            borderRadius: 10, padding: '18px 20px',
+            background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 10, padding: '18px 20px',
             borderLeft: `3px solid ${totalAdded > 0 ? 'var(--green)' : 'var(--muted)'}`,
           }}>
             <div style={{ fontSize: 26, fontWeight: 700, color: totalAdded > 0 ? 'var(--green)' : 'var(--muted)' }}>
               {totalAdded} new project{totalAdded !== 1 ? 's' : ''} added
             </div>
             <div style={{ fontSize: 13, color: 'var(--muted)', marginTop: 4 }}>
-              {totalAdded > 0
-                ? 'Switch to the Projects tab to review them.'
-                : 'No new projects found — results matched existing entries or sources returned nothing.'}
+              {totalAdded > 0 ? 'Switch to the Projects tab to review them.' : 'No new projects found — results matched existing entries or sources returned nothing.'}
             </div>
           </div>
-          <div style={{ display: 'flex', gap: 10 }}>
-            <button onClick={reset} style={{
-              padding: '7px 16px', borderRadius: 7,
-              border: '1px solid var(--border2)',
-              background: 'var(--surface)', color: 'var(--text)', fontSize: 13,
-            }}>
-              Run again
-            </button>
-          </div>
+          <button onClick={reset} style={{ padding: '7px 16px', borderRadius: 7, border: '1px solid var(--border2)', background: 'var(--surface)', color: 'var(--text)', fontSize: 13, width: 'fit-content' }}>
+            Run again
+          </button>
         </div>
       )}
     </div>
@@ -315,56 +327,36 @@ export default function ResearchPanel({ onComplete }: Props) {
 }
 
 function ProgressRow({ item, compact }: { item: SourceResult; compact?: boolean }) {
-  const statusIcon = () => {
-    if (item.status === 'running') return (
-      <span style={{
-        width: 12, height: 12, border: '2px solid var(--accent-dim)',
-        borderTopColor: 'var(--accent)', borderRadius: '50%',
-        animation: 'spin 0.7s linear infinite', display: 'inline-block', flexShrink: 0,
-      }} />
-    )
-    if (item.status === 'done') return (
-      <svg width="12" height="12" fill="none" stroke="var(--green)" strokeWidth="2.5" viewBox="0 0 24 24" style={{ flexShrink: 0 }}>
-        <polyline points="20 6 9 17 4 12"/>
-      </svg>
-    )
-    if (item.status === 'error') return (
-      <svg width="12" height="12" fill="none" stroke="var(--red)" strokeWidth="2.5" viewBox="0 0 24 24" style={{ flexShrink: 0 }}>
-        <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
-      </svg>
-    )
-    return <span style={{ width: 12, height: 12, borderRadius: '50%', background: 'var(--surface3)', flexShrink: 0, display: 'inline-block' }} />
-  }
-
   return (
     <div style={{
       display: 'flex', alignItems: 'center', gap: 10,
-      padding: compact ? '5px 10px' : '9px 12px',
-      background: 'var(--surface2)', borderRadius: 7,
-      border: `1px solid ${
-        item.status === 'running' ? 'rgba(59,130,246,0.25)' :
-        item.status === 'error'   ? 'rgba(239,68,68,0.2)'  :
-        item.status === 'done' && item.added > 0 ? 'rgba(34,197,94,0.2)' :
-        'var(--border)'
-      }`,
-      opacity: item.status === 'pending' ? 0.4 : 1,
-      transition: 'all 0.2s',
+      padding: compact ? '5px 10px' : '9px 12px', borderRadius: 7,
+      background: 'var(--surface2)',
+      border: `1px solid ${item.status === 'running' ? 'rgba(59,130,246,0.25)' : item.status === 'error' ? 'rgba(239,68,68,0.2)' : item.status === 'done' && item.added > 0 ? 'rgba(34,197,94,0.2)' : 'var(--border)'}`,
+      opacity: item.status === 'pending' ? 0.4 : 1, transition: 'all 0.2s',
     }}>
-      {statusIcon()}
+      {item.status === 'running' && (
+        <span style={{ width: 12, height: 12, border: '2px solid var(--accent-dim)', borderTopColor: 'var(--accent)', borderRadius: '50%', animation: 'spin 0.7s linear infinite', display: 'inline-block', flexShrink: 0 }} />
+      )}
+      {item.status === 'done' && (
+        <svg width="12" height="12" fill="none" stroke="var(--green)" strokeWidth="2.5" viewBox="0 0 24 24" style={{ flexShrink: 0 }}><polyline points="20 6 9 17 4 12"/></svg>
+      )}
+      {item.status === 'error' && (
+        <svg width="12" height="12" fill="none" stroke="var(--red)" strokeWidth="2.5" viewBox="0 0 24 24" style={{ flexShrink: 0 }}><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+      )}
+      {item.status === 'pending' && (
+        <span style={{ width: 12, height: 12, borderRadius: '50%', background: 'var(--surface3)', flexShrink: 0, display: 'inline-block' }} />
+      )}
       <span style={{ flex: 1, fontSize: compact ? 11 : 13, color: 'var(--text)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
         {item.label}
       </span>
-      {item.status === 'running' && (
-        <span style={{ fontSize: 11, color: 'var(--accent)', whiteSpace: 'nowrap' }}>scanning...</span>
-      )}
+      {item.status === 'running' && <span style={{ fontSize: 11, color: 'var(--accent)', whiteSpace: 'nowrap' }}>scanning...</span>}
       {item.status === 'done' && (
-        <span style={{ fontSize: 11, color: item.added > 0 ? 'var(--green)' : 'var(--muted)', fontWeight: item.added > 0 ? 600 : 400, whiteSpace: 'nowrap' }}>
+        <span style={{ fontSize: 11, whiteSpace: 'nowrap', color: item.added > 0 ? 'var(--green)' : 'var(--muted)', fontWeight: item.added > 0 ? 600 : 400 }}>
           {item.added > 0 ? `+${item.added} new` : `${item.found} found, 0 new`}
         </span>
       )}
-      {item.status === 'error' && (
-        <span style={{ fontSize: 11, color: 'var(--red)', whiteSpace: 'nowrap' }}>failed</span>
-      )}
+      {item.status === 'error' && <span style={{ fontSize: 11, color: 'var(--red)', whiteSpace: 'nowrap' }}>failed</span>}
     </div>
   )
 }
