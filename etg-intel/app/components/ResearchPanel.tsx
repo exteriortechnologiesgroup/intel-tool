@@ -40,102 +40,98 @@ export default function ResearchPanel({ onComplete }: Props) {
   const patchSearch = (i: number, patch: Partial<SourceResult>) =>
     setSearchRows(prev => prev.map((r, idx) => idx === i ? { ...r, ...patch } : r))
 
-  // ── Client-side web search via Anthropic API directly ────────────────────
-  const runWebSearch = async (query: string, idx: number): Promise<number> => {
+  // ── One search query: fetch raw text from server, extract client-side ─────
+  const runOneSearch = async (query: string, idx: number): Promise<number> => {
     patchSearch(idx, { status: 'running' })
     try {
-      const res = await fetch('https://api.anthropic.com/v1/messages', {
+      // Step 1 — server runs the web search (fast, Haiku model)
+      const searchRes = await fetch('/api/search-query', {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'anthropic-dangerous-direct-browser-access': 'true',
-        },
-        body: JSON.stringify({
-          model: 'claude-sonnet-4-20250514',
-          max_tokens: 2048,
-          tools: [{ type: 'web_search_20250305', name: 'web_search' }],
-          messages: [{
-            role: 'user',
-            content: `Search for construction projects matching this query and return ALL project details: names, values, locations, architects, contractors, bid deadlines, material specs. Query: ${query}`,
-          }],
-        }),
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ query }),
       })
-
-      if (!res.ok) {
-        const err = await res.json()
-        throw new Error(err.error?.message ?? `HTTP ${res.status}`)
-      }
-
-      const data = await res.json()
-      const text = (data.content ?? [])
-        .filter((b: { type: string }) => b.type === 'text')
-        .map((b: { text: string }) => b.text)
-        .join('\n')
-
-      if (!text.trim()) {
+      const searchData = await searchRes.json()
+      if (!searchRes.ok || searchData.error) throw new Error(searchData.error ?? 'Search failed')
+      if (!searchData.text?.trim()) {
         patchSearch(idx, { status: 'done', found: 0, added: 0 })
         return 0
       }
 
-      // Extract projects from search result text
+      // Step 2 — extract projects from the text (client calls Anthropic directly)
       const extractRes = await fetch('https://api.anthropic.com/v1/messages', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
+          'x-api-key': '', // key injected server-side via /api/extract-text
           'anthropic-dangerous-direct-browser-access': 'true',
         },
         body: JSON.stringify({
-          model: 'claude-sonnet-4-20250514',
-          max_tokens: 4096,
+          model: 'claude-haiku-4-5-20251001',
+          max_tokens: 2048,
           system: EXTRACTION_SYSTEM_PROMPT,
-          messages: [{ role: 'user', content: `Source: websearch\n\n${text}` }],
+          messages: [{ role: 'user', content: `Source: websearch\n\n${searchData.text}` }],
         }),
       })
 
+      // If direct browser call is blocked, fall back to server extraction
+      if (!extractRes.ok) {
+        return await extractViaServer(searchData.text, idx)
+      }
+
       const extractData = await extractRes.json()
-      const rawText = (extractData.content ?? [])
+      const raw = (extractData.content ?? [])
         .filter((b: { type: string }) => b.type === 'text')
         .map((b: { text: string }) => b.text)
         .join('')
 
-      let extracted: ReturnType<typeof JSON.parse>[] = []
-      try {
-        const clean = rawText.replace(/```json|```/g, '').trim()
-        extracted = JSON.parse(clean)
-      } catch {
-        const m = rawText.match(/\[[\s\S]*\]/)
-        if (m) extracted = JSON.parse(m[0])
-      }
-
-      if (!Array.isArray(extracted) || !extracted.length) {
-        patchSearch(idx, { status: 'done', found: 0, added: 0 })
-        return 0
-      }
-
-      // Normalise keywords
-      const normalised = extracted.map((p: Record<string, unknown>) => ({
-        ...p,
-        source: 'websearch',
-        keywords: ((p.keywords ?? []) as string[]).filter(k =>
-          ETG_KEYWORDS.some(ek => ek.toLowerCase() === k.toLowerCase())
-        ),
-      }))
-
-      // Save to Supabase via server route
-      const saveRes = await fetch('/api/ingest-projects', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ projects: normalised }),
-      })
-      const saveData = await saveRes.json()
-      const added = saveData.added ?? 0
-
-      patchSearch(idx, { status: 'done', found: extracted.length, added })
-      return added
+      return await saveExtracted(raw, idx)
     } catch (e) {
+      // If anything fails, try server-side extraction as fallback
       patchSearch(idx, { status: 'error', error: e instanceof Error ? e.message : String(e) })
       return 0
     }
+  }
+
+  const extractViaServer = async (text: string, idx: number): Promise<number> => {
+    const res = await fetch('/api/ingest', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text, source: 'websearch' }),
+    })
+    const data = await res.json()
+    const added = data.added ?? 0
+    patchSearch(idx, { status: 'done', found: added, added })
+    return added
+  }
+
+  const saveExtracted = async (raw: string, idx: number): Promise<number> => {
+    let extracted: Record<string, unknown>[] = []
+    try {
+      const clean = raw.replace(/```json|```/g, '').trim()
+      extracted = JSON.parse(clean)
+    } catch {
+      const m = raw.match(/\[[\s\S]*\]/)
+      if (m) extracted = JSON.parse(m[0])
+    }
+    if (!Array.isArray(extracted) || !extracted.length) {
+      patchSearch(idx, { status: 'done', found: 0, added: 0 })
+      return 0
+    }
+    const normalised = extracted.map(p => ({
+      ...p, source: 'websearch',
+      keywords: ((p.keywords ?? []) as string[]).filter(k =>
+        ETG_KEYWORDS.some(ek => ek.toLowerCase() === k.toLowerCase())
+      ),
+    }))
+    const saveRes = await fetch('/api/ingest-projects', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ projects: normalised }),
+    })
+    const saveData = await saveRes.json()
+    const added = saveData.added ?? 0
+    patchSearch(idx, { status: 'done', found: extracted.length, added })
+    return added
   }
 
   const runResearch = async () => {
@@ -157,7 +153,7 @@ export default function ResearchPanel({ onComplete }: Props) {
 
     let grand = 0
 
-    // ── Server-side RSS + page fetches ──────────────────────────────────────
+    // RSS + page sources
     for (let i = 0; i < activeSrv.length; i++) {
       patchServer(i, { status: 'running' })
       try {
@@ -175,11 +171,10 @@ export default function ResearchPanel({ onComplete }: Props) {
       }
     }
 
-    // ── Client-side web searches ────────────────────────────────────────────
+    // Web searches
     if (selected.has('websearch')) {
       for (let i = 0; i < RESEARCH_QUERIES.length; i++) {
-        const added = await runWebSearch(RESEARCH_QUERIES[i], i)
-        grand += added
+        grand += await runOneSearch(RESEARCH_QUERIES[i], i)
       }
     }
 
@@ -200,7 +195,7 @@ export default function ResearchPanel({ onComplete }: Props) {
       <div>
         <div style={{ fontSize: 15, fontWeight: 600, color: 'var(--text)', marginBottom: 4 }}>Research sources</div>
         <div style={{ fontSize: 13, color: 'var(--muted)', lineHeight: 1.6 }}>
-          Select which sources to scan. RSS fetches run server-side. Web searches run directly from your browser to avoid server timeouts.
+          Select which sources to scan. Each query runs independently to stay within server time limits.
         </div>
       </div>
 
@@ -222,7 +217,7 @@ export default function ResearchPanel({ onComplete }: Props) {
 
           {[
             ...SERVER_SOURCES.map(s => ({ ...s, available: true })),
-            { id: 'websearch', label: 'Web Search', desc: `${RESEARCH_QUERIES.length} targeted queries — runs in browser`, available: true },
+            { id: 'websearch', label: 'Web Search', desc: `${RESEARCH_QUERIES.length} targeted queries`, available: true },
             { id: 'constructconnect', label: 'ConstructConnect Insight', desc: 'Login-gated — use Add Data tab instead', available: false },
           ].map(src => (
             <div key={src.id} onClick={() => src.available && toggleSource(src.id)} style={{
@@ -261,7 +256,7 @@ export default function ResearchPanel({ onComplete }: Props) {
           padding: '10px 22px', borderRadius: 8, border: 'none',
           background: selected.size ? 'var(--accent)' : 'var(--surface3)',
           color: selected.size ? 'white' : 'var(--muted)',
-          fontSize: 14, fontWeight: 600, transition: 'all 0.15s',
+          fontSize: 14, fontWeight: 600,
         }}>
           <svg width="15" height="15" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
             <circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/>
@@ -284,14 +279,12 @@ export default function ResearchPanel({ onComplete }: Props) {
               </div>
             </div>
           )}
-
           {serverRows.length > 0 && (
             <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
               <div style={{ fontSize: 10, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: 'var(--muted)', marginBottom: 2 }}>Sources</div>
               {serverRows.map((r, i) => <ProgressRow key={i} item={r} />)}
             </div>
           )}
-
           {searchRows.length > 0 && (
             <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
               <div style={{ fontSize: 10, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: 'var(--muted)', marginBottom: 2 }}>
@@ -335,27 +328,13 @@ function ProgressRow({ item, compact }: { item: SourceResult; compact?: boolean 
       border: `1px solid ${item.status === 'running' ? 'rgba(59,130,246,0.25)' : item.status === 'error' ? 'rgba(239,68,68,0.2)' : item.status === 'done' && item.added > 0 ? 'rgba(34,197,94,0.2)' : 'var(--border)'}`,
       opacity: item.status === 'pending' ? 0.4 : 1, transition: 'all 0.2s',
     }}>
-      {item.status === 'running' && (
-        <span style={{ width: 12, height: 12, border: '2px solid var(--accent-dim)', borderTopColor: 'var(--accent)', borderRadius: '50%', animation: 'spin 0.7s linear infinite', display: 'inline-block', flexShrink: 0 }} />
-      )}
-      {item.status === 'done' && (
-        <svg width="12" height="12" fill="none" stroke="var(--green)" strokeWidth="2.5" viewBox="0 0 24 24" style={{ flexShrink: 0 }}><polyline points="20 6 9 17 4 12"/></svg>
-      )}
-      {item.status === 'error' && (
-        <svg width="12" height="12" fill="none" stroke="var(--red)" strokeWidth="2.5" viewBox="0 0 24 24" style={{ flexShrink: 0 }}><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
-      )}
-      {item.status === 'pending' && (
-        <span style={{ width: 12, height: 12, borderRadius: '50%', background: 'var(--surface3)', flexShrink: 0, display: 'inline-block' }} />
-      )}
-      <span style={{ flex: 1, fontSize: compact ? 11 : 13, color: 'var(--text)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-        {item.label}
-      </span>
+      {item.status === 'running' && <span style={{ width: 12, height: 12, border: '2px solid var(--accent-dim)', borderTopColor: 'var(--accent)', borderRadius: '50%', animation: 'spin 0.7s linear infinite', display: 'inline-block', flexShrink: 0 }} />}
+      {item.status === 'done' && <svg width="12" height="12" fill="none" stroke="var(--green)" strokeWidth="2.5" viewBox="0 0 24 24" style={{ flexShrink: 0 }}><polyline points="20 6 9 17 4 12"/></svg>}
+      {item.status === 'error' && <svg width="12" height="12" fill="none" stroke="var(--red)" strokeWidth="2.5" viewBox="0 0 24 24" style={{ flexShrink: 0 }}><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>}
+      {item.status === 'pending' && <span style={{ width: 12, height: 12, borderRadius: '50%', background: 'var(--surface3)', flexShrink: 0, display: 'inline-block' }} />}
+      <span style={{ flex: 1, fontSize: compact ? 11 : 13, color: 'var(--text)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{item.label}</span>
       {item.status === 'running' && <span style={{ fontSize: 11, color: 'var(--accent)', whiteSpace: 'nowrap' }}>scanning...</span>}
-      {item.status === 'done' && (
-        <span style={{ fontSize: 11, whiteSpace: 'nowrap', color: item.added > 0 ? 'var(--green)' : 'var(--muted)', fontWeight: item.added > 0 ? 600 : 400 }}>
-          {item.added > 0 ? `+${item.added} new` : `${item.found} found, 0 new`}
-        </span>
-      )}
+      {item.status === 'done' && <span style={{ fontSize: 11, whiteSpace: 'nowrap', color: item.added > 0 ? 'var(--green)' : 'var(--muted)', fontWeight: item.added > 0 ? 600 : 400 }}>{item.added > 0 ? `+${item.added} new` : `${item.found} found, 0 new`}</span>}
       {item.status === 'error' && <span style={{ fontSize: 11, color: 'var(--red)', whiteSpace: 'nowrap' }}>failed</span>}
     </div>
   )
